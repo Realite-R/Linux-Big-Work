@@ -15,22 +15,40 @@
 #include <unistd.h>
 #include <wchar.h>
 
+// 用来储存会话列表的结构体 会话id 会话更新时间 占用情况 标题
 typedef struct { unsigned long id; long long updated; int busy; char *title; } entry_t;
+// 用来储存历史会话信息的结构体
+// role 是消息发出者 saved表示消息状态 0是异常 2是仅供查看（只由0转换过来），1是正常消息
 typedef struct { char role; int saved; char *text; size_t length; } message_t;
+// 用来保存一段聊天内容排版之后的多段文字
+// item[0] 表示一个聊天记录第一行记录的内容
 typedef struct { char **items; size_t count; } lines_t;
 enum { IDLE, LISTING, OPENING, LEAVING, REPLYING };
+
+// 这里将显示一个ui界面（会话界面）所需要的所有信息整合成一个结构体
 typedef struct {
+    // fd 连接的服务端，operation ui状态 chatting 表示当前是否再聊天界面（即有可能再会话选择状态） got_begin 代表准备接受服务端的回答
+    // history_message 表示当前是否在接受session的message信息 
     int fd, operation, chatting, got_begin, history_message, navigation_paste;
+    // session id
     unsigned long id;
+    // session 标题
     char *title;
+    // 会话列表
     entry_t *entries;
+    // 会话数量和选择的会话下标
     size_t count, selected;
+    // 当前的聊天消息历史
     message_t *messages;
+    // 当前聊天历史的数量
     size_t message_count, turn_start;
+    // scroll从最新的内容上面偏移了多少行
     int columns, rows, scroll, history_height;
     char status[256];
+    // 这个是暂存缓冲区，recv可能不会返回一个完整的数据帧，所以会暂存在这个地方
     char frame[PROTOCOL_MAX_LINE];
     size_t frame_length;
+    // 编辑器结构体，用来储存当前的问题，并对光标移动做出处理
     client_editor_t *editor;
 } ui_t;
 
@@ -143,13 +161,19 @@ static int new_message(ui_t *ui, char role, int saved) {
     return 0;
 }
 
+/*
+将text字符串拼接再ui的最新message字符串后面
+*/
 static int append_message(ui_t *ui, const char *text) {
     if (!ui->message_count) { errno = EPROTO; return -1; }
+    // 指针是从零开始计数的，需要 count-1
+    // m指针存的是ui地址，对m修改就是对ui修改
     message_t *m = &ui->messages[ui->message_count - 1];
     size_t count = strlen(text);
     if (count > (size_t)-1 - m->length - 1) { errno = EOVERFLOW; return -1; }
     char *resized = realloc(m->text, m->length + count + 1);
     if (!resized) return -1;
+    // 这个里面是再已有的消息文本上面拼接
     memcpy(resized + m->length, text, count + 1);
     m->text = resized; m->length += count; return 0;
 }
@@ -235,6 +259,10 @@ static int draw(ui_t *ui) {
     fflush(stdout); return ferror(stdout) ? -1 : 0;
 }
 
+/*
+表示向服务端发送请求
+command表示发送的数据帧类型，opeartion设置ui的当前的状态
+*/
 static int request(ui_t *ui, const char *command, int operation) {
     if (protocol_send_all(ui->fd, command, strlen(command)) < 0) return -1;
     ui->operation = operation;
@@ -249,65 +277,112 @@ static int compare_entries(const void *a, const void *b) {
     return x->id > y->id ? -1 : x->id < y->id;
 }
 
+/*
+在完成了对一个数据帧的处理之后 都会把operation设置成IDLE状态表示操作结束
+*/
 static int handle_frame(ui_t *ui, const char *line) {
     char text[PROTOCOL_MAX_LINE];
+
+    // Error 数据帧处理
     if (strncmp(line, "ERROR ", 6) == 0) {
         if (protocol_unescape(line + 6, text, sizeof(text)) < 0) return -1;
         snprintf(ui->status, sizeof(ui->status), "Error: %.240s", text);
         ui->operation = IDLE; ui->got_begin = 0; return 0;
     }
+
+    // listening 状态接受会话列表状态处理
+    // 对应的内容是查看当前有多少会话可以选择，选择到哪一个列表切过去
+    /*
+    一个会话数据帧的实例如下
+    SESSIONS_BEGIN
+    SESSION 3 1760400000 0 会话标题1
+    。。。 会话标题2
+    SESSIONS_END
+    */
     if (ui->operation == LISTING) {
         if (!strcmp(line, "SESSIONS_BEGIN")) return 0;
+
         if (!strcmp(line, "SESSIONS_END")) {
             if (ui->count > 1) qsort(ui->entries, ui->count, sizeof(*ui->entries), compare_entries);
             ui->operation = IDLE; ui->status[0] = 0; return 0;
         }
+
         entry_t entry; int offset = 0;
+        // 从字符串里面读取到 会话编号 会话的更新时间 会话是否占用 
+        // line + offset + 1 代表的是 会话标题 存在text变量里面
         if (sscanf(line, "SESSION %lu %lld %d%n", &entry.id, &entry.updated, &entry.busy, &offset) != 3 ||
             !offset || line[offset] != ' ' || protocol_unescape(line + offset + 1, text, sizeof(text)) < 0) goto invalid;
         entry.title = strdup(text);
         if (!entry.title) return -1;
+        // 在当前的会话列表里面开辟一个空间存一个entries
         entry_t *entries = realloc(ui->entries, (ui->count + 1) * sizeof(*entries));
         if (!entries) { free(entry.title); return -1; }
         ui->entries = entries; ui->entries[ui->count++] = entry; return 0;
     }
+
+    // 对应客户端选择了一个会话之后，等待服务端返回完整的会话历史
     if (ui->operation == OPENING) {
+        // 按照代码组织的顺序依次出现如下的数据帧类别
+
+        // 返回会话id 和会话标题
         if (strncmp(line, "OPENED ", 7) == 0) {
             int offset = 0; unsigned long id;
             if (sscanf(line, "OPENED %lu%n", &id, &offset) != 1 || !offset || line[offset] != ' ' ||
                 protocol_unescape(line + offset + 1, text, sizeof(text)) < 0) goto invalid;
             char *title = strdup(text); if (!title) return -1;
+            // 更新当前ui信息 清空当前的历史消息 和问题编辑区的字符
             free(ui->title); ui->title = title; ui->id = id;
             clear_messages(ui); client_editor_clear(ui->editor); ui->chatting = 1; return 0;
         }
+
+        // 代表会话传输结束
         if (!strcmp(line, "HISTORY_END") && !ui->history_message) {
             ui->operation = IDLE; ui->status[0] = 0; return 0;
         }
+
+        // 一个对话记录的开始
         if (strncmp(line, "MESSAGE ", 8) == 0 && !ui->history_message) {
             char role, extra; int context;
+            // role用来区分user 和 模型assistant 
+            // context 为0的时候为异常消息，计入message的时候saved将为2，不作为模型上下文
             if (sscanf(line, "MESSAGE %c %d %c", &role, &context, &extra) != 2 || !strchr("UAX", role)) goto invalid;
+            // 扩充ui的message变量，使其能够再放下一个message信息
             if (new_message(ui, role, context ? 1 : 2) < 0) return -1;
+            // 设置这个变量表示开始处理message 但是感觉有点冗余
             ui->history_message = 1; return 0;
         }
+        // 对话记录结束
         if (!strcmp(line, "MESSAGE_END") && ui->history_message) { ui->history_message = 0; return 0; }
+
+        // 添加一个会话记录
         if (!strncmp(line, "TEXT ", 5) && ui->history_message) {
             if (protocol_unescape(line + 5, text, sizeof(text)) < 0) return -1;
             return append_message(ui, text);
         }
     }
+
+    // 
     if (ui->operation == LEAVING && !strcmp(line, "LEFT")) {
+        // 清空当前的会话
         clear_messages(ui); ui->chatting = 0; ui->id = 0;
+        // 发送session请求并设置listeing等待会话回传
         return request(ui, "SESSIONS\n", LISTING);
     }
+
+
     if (ui->operation == REPLYING) {
+        // 接受回答的起始帧
         if (!strcmp(line, "BEGIN") && !ui->got_begin) {
             ui->got_begin = 1; return new_message(ui, 'A', 0);
         }
+        // 接受回答 一个数据帧接受的只是回复的部分内容
         if (!strncmp(line, "DATA ", 5) && ui->got_begin) {
             if (protocol_unescape(line + 5, text, sizeof(text)) < 0) return -1;
             /* Keep the same old viewport while the reply grows below it. */
             lines_t before = {0}, after = {0};
             if (ui->scroll && history_lines(ui, &before) < 0) { free_lines(&before); return -1; }
+
+            // 加入消息
             int result = append_message(ui, text);
             if (!result && ui->scroll) {
                 if (history_lines(ui, &after) < 0) result = -1;
@@ -315,10 +390,14 @@ static int handle_frame(ui_t *ui, const char *line) {
             }
             free_lines(&before); free_lines(&after); return result;
         }
+
+
         if (!strcmp(line, "END") && ui->got_begin) {
             int first_saved_turn = 1;
+            // 看看是否有保存过的会话记录
             for (size_t i = 0; i < ui->turn_start; ++i)
                 if (ui->messages[i].saved != 0) first_saved_turn = 0;
+            // 会话标题的生成
             if (first_saved_turn && ui->title && !strcmp(ui->title, "New conversation")) {
                 const char *question = ui->messages[ui->turn_start].text;
                 size_t bytes = 0, characters = 0;
@@ -348,11 +427,13 @@ static int receive_frames(ui_t *ui) {
     if (count <= 0) { if (!count) errno = ECONNRESET; return -1; }
     for (ssize_t i = 0; i < count; ++i) {
         if (bytes[i] == '\n') {
+            // 这个分支处理数据帧的边界
             ui->frame[ui->frame_length] = 0;
             if (handle_frame(ui, ui->frame) < 0) return -1;
             ui->frame_length = 0;
         } else {
             if (ui->frame_length + 1 >= sizeof(ui->frame) || bytes[i] == 0) { errno = EPROTO; return -1; }
+            // 如果没有遇到数据帧边界就暂存在ui->frame 里面
             ui->frame[ui->frame_length++] = bytes[i];
         }
     }
@@ -383,6 +464,7 @@ static int navigation_key(void) {
 }
 
 static int keyboard(ui_t *ui) {
+    // 在聊天界面下 并且是在能够操作的情况下 
     if (ui->chatting && ui->operation == IDLE && !ui->navigation_paste) {
         int key = client_editor_read_key(ui->editor);
         if (key == CLIENT_EDITOR_EXIT) { stopped = 1; return 0; }
@@ -423,19 +505,27 @@ static int keyboard(ui_t *ui) {
 }
 
 int client_ui_run(int socket_fd) {
+
+    // 准备中文环境
     if (!setlocale(LC_CTYPE, "") || MB_CUR_MAX < 4) {
         if (!setlocale(LC_CTYPE, "C.UTF-8")) { errno = EILSEQ; return -1; }
     }
+    // 初始化全屏界面的状态
     ui_t ui = {.fd = socket_fd};
     ui.editor = client_editor_create(PROTOCOL_MAX_INPUT);
     if (!ui.editor) return -1;
     int result = -1, installed = 0;
+
+    // 
     const int signals[] = {SIGINT, SIGTERM, SIGHUP, SIGWINCH};
     struct sigaction previous[4], action = {0};
+    // 转换ui的函数
     sigemptyset(&action.sa_mask); action.sa_handler = ui_signal;
     stopped = window_changed = 0;
+    // 给四个信号都配置上ui_signal的中断函数
     for (; installed < 4; ++installed)
         if (sigaction(signals[installed], &action, &previous[installed]) < 0) goto cleanup;
+    // 终端的各种配置
     if (tcgetattr(STDIN_FILENO, &saved_termios) < 0) goto cleanup;
     struct termios raw = saved_termios;
     raw.c_lflag &= (tcflag_t)~(ICANON | ECHO | ISIG | IEXTEN);
@@ -444,20 +534,30 @@ int client_ui_run(int socket_fd) {
     if (atexit(terminal_restore) != 0) { errno = ENOMEM; goto cleanup; }
     if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) < 0) goto cleanup;
     active = 1;
+
+
     fputs("\033[?1049h\033[?2004h", stdout);
+    // 向服务端发送session请求，并且绘制ui界面
     if (request(&ui, "SESSIONS\n", LISTING) < 0 || draw(&ui) < 0) goto cleanup;
+
+    // ui界面主循环
     while (!stopped) {
+        // 第一个是服务端口监听，第二个是键盘的端口监听
         struct pollfd fds[] = {{.fd = socket_fd, .events = POLLIN}, {.fd = STDIN_FILENO, .events = POLLIN}};
         int pending = client_editor_pending(ui.editor);
         int count = poll(fds, 2, pending ? 0 : 100);
         if (count < 0 && errno != EINTR) goto cleanup;
+        // 检测到服务器监听端口有事件
         if (count > 0 && fds[0].revents && receive_frames(&ui) < 0) goto cleanup;
+        // 检测到键盘里面有事件或者曾经有暂存的字符就执行
         if ((pending || (count > 0 && fds[1].revents)) && keyboard(&ui) < 0) goto cleanup;
         if (count > 0 || pending || window_changed) {
             window_changed = 0;
             if (draw(&ui) < 0) goto cleanup;
         }
     }
+
+
     (void)protocol_send_quit(socket_fd);
     result = 0;
  cleanup: {

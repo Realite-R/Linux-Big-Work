@@ -29,9 +29,10 @@ static int parse_port(const char *text, unsigned short *port_out) {
 }
 
 /*
-用来主动连接端口的函数
+用来主动连接服务端监听的网络端口的函数
 */
 static int connect_to_server(const char *host, unsigned short port) {
+    // 创建IPv4，TCP的网络进程socket对象
     int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_fd < 0) {
         perror("client: socket");
@@ -60,12 +61,16 @@ static int connect_to_server(const char *host, unsigned short port) {
     return socket_fd;
 }
 
+/*
+对服务端生成的内容做出处理，其中包含了流式输出的实现
+*/
 static int receive_reply(int socket_fd) {
     char line[PROTOCOL_MAX_LINE];
     char payload[PROTOCOL_MAX_LINE];
     int got_begin = 0;
 
     for (;;) {
+        // 解析服务端的数据帧的程序,在此时正文里面的转义字符没有被解析出来
         int result = protocol_read_line(socket_fd, line, sizeof(line));
         if (result == 0) {
             fprintf(stderr, "client: server closed the connection\n");
@@ -87,6 +92,7 @@ static int receive_reply(int socket_fd) {
             continue;
         }
         if (strncmp(line, "DATA ", 5) == 0) {
+            // 这个时候就要先解析一下转义字符的内容
             if (!got_begin || protocol_unescape(line + 5, payload, sizeof(payload)) < 0) {
                 fprintf(stderr, "client: invalid DATA frame\n");
                 return -1;
@@ -124,6 +130,7 @@ int main(int argc, char **argv) {
     const char *host = "127.0.0.1";
     unsigned short port = PROTOCOL_DEFAULT_PORT;
 
+    // 检测是否使用plain选项
     int plain = argc > 1 && strcmp(argv[1], "--plain") == 0;
     if (plain) { --argc; ++argv; }
 
@@ -154,6 +161,7 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
+    // 进入全屏聊天的判断，为真时全屏聊天
     if (!plain && client_ui_available()) {
         int result = client_ui_run(socket_fd);
         if (result < 0) perror("client: session interface");
@@ -161,8 +169,10 @@ int main(int argc, char **argv) {
         return result < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
     }
 
+    // 这个分支之下就是普通模式聊天，不会再额外进入一个记录
     char input[PROTOCOL_MAX_INPUT];
     for (;;) {
+        // 处理光标移动等复杂问题的函数 （核心代码）
         int input_result = client_read_input(input, sizeof(input));
         if (input_result <= 0) {
             if (input_result < 0) {
@@ -182,6 +192,7 @@ int main(int argc, char **argv) {
             perror("client: send");
             break;
         }
+        // 处理服务端发挥的信息 （核心代码）
         if (receive_reply(socket_fd) < 0) {
             break;
         }

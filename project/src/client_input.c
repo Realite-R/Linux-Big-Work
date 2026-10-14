@@ -16,8 +16,10 @@
 /* Text offsets are UTF-8 byte offsets; display coordinates are terminal cells. */
 typedef struct { int row, column; } position_t;
 typedef struct client_editor {
+    // 存东西
     char *text;
     size_t capacity, length, cursor;
+    // 存每一个东西在排版上放在哪里
     position_t *positions;
     int columns, rows, top, drawn_rows, screen_row, goal_column;
     int pending_byte, pasting, paste_cr, paste_overflow;
@@ -399,10 +401,13 @@ client_editor_t *client_editor_create(size_t capacity) {
     if (capacity < 2 || capacity > PROTOCOL_MAX_INPUT) { errno = EINVAL; return NULL; }
     editor_t *e = calloc(1, sizeof(*e));
     if (!e) return NULL;
+    // 开一个能够接受 4096字节的text空间
     e->text = calloc(capacity, 1);
     e->positions = calloc(capacity, sizeof(*e->positions));
+
     if (!e->text || !e->positions) { free(e->text); free(e->positions); free(e); return NULL; }
     e->capacity = capacity; e->pending_byte = e->goal_column = -1;
+    
     interrupted = 0;
     return e;
 }
