@@ -130,19 +130,28 @@ static int open_log(logger_t *logger, const char *directory, unsigned long id) {
 }
 
 static void handle_client(int client_fd, const char *directory) {
+    // 子进程负责当前客户端的多次操作；client_fd 是连接描述符，directory 是会话存储目录
+    // line 保存原始协议帧，question 保存去掉 Q 前缀并还原转义后的问题正文
     char line[PROTOCOL_MAX_LINE], question[PROTOCOL_MAX_INPUT];
+    // stored 持有完整会话历史和文件锁；-1 表示尚未打开锁文件
     stored_session_t stored = {.lock_fd = -1};
+    // session 保存内存上下文；logger 写当前会话的聊天正文日志，不是服务活动日志
     session_t session;
     session_init(&session);
     logger_t logger = {.fd = -1};
+    // 使用过会话管理命令后置为 1，要求先选会话；普通客户端则可在首次提问时自动创建
     int managed = 0;
     for (;;) {
+        // 等待当前客户端的一行请求；超长行已被读取函数丢弃，可以报错后继续接收
         int result = protocol_read_line(client_fd, line, sizeof(line));
         if (result <= 0) {
             if (result == -2) { (void)protocol_send_error(client_fd, "request line is too long"); continue; }
             break;
         }
+        // QUIT、连接关闭或读取失败会离开循环，统一执行末尾的资源清理
         if (strcmp(line, "QUIT") == 0) break;
+        // 获取列表：开始标记 -> 多条 SESSION -> 结束标记
+        // store_list 每发现一个会话，就回调 send_list_entry；&client_fd 指明发送到哪个连接
         if (strcmp(line, "SESSIONS") == 0) {
             managed = 1;
             if (send_literal(client_fd, "SESSIONS_BEGIN\n") < 0) break;
@@ -151,6 +160,7 @@ static void handle_client(int client_fd, const char *directory) {
             } else if (send_literal(client_fd, "SESSIONS_END\n") < 0) break;
             continue;
         }
+        // 返回列表：关闭聊天日志、释放会话锁并清空上下文，磁盘历史和 TCP 连接仍保留
         if (strcmp(line, "LEAVE") == 0) {
             managed = 1;
             logger_close(&logger); store_close(&stored);
@@ -158,18 +168,22 @@ static void handle_client(int client_fd, const char *directory) {
             if (send_literal(client_fd, "LEFT\n") < 0) break;
             continue;
         }
+        // NEW 创建空会话；OPEN <id> 打开已有会话，两者共用后面的切换和历史发送流程
         if (strcmp(line, "NEW") == 0 || strncmp(line, "OPEN ", 5) == 0) {
             managed = 1;
+            // 先准备候选会话，加载成功前不释放当前会话，避免切换失败丢掉当前状态
             stored_session_t candidate = {.lock_fd = -1};
             int opened;
             if (strcmp(line, "NEW") == 0) opened = store_create(directory, &candidate);
             else {
+                // 跳过 OPEN 和空格，解析十进制 ID，并拒绝空值、尾随字符、0 和越界值
                 char *end = NULL;
                 errno = 0;
                 unsigned long id = strtoul(line + 5, &end, 10);
                 if (errno || end == line + 5 || *end || !id || line[5] < '0' || line[5] > '9') {
                     (void)protocol_send_error(client_fd, "invalid session id"); continue;
                 }
+                // 存储模块先获取独占锁再读历史；被其他客户端占用时立即失败，不等待
                 opened = store_open(directory, id, &candidate);
             }
             if (opened < 0) {
@@ -177,22 +191,27 @@ static void handle_client(int client_fd, const char *directory) {
                 if (protocol_send_error(client_fd, error) < 0) break;
                 continue;
             }
+            // 从候选会话的成功用户/助手轮次恢复模型上下文，数量上限由 session 模块控制
             session_t restored;
             if (store_context(&candidate, &restored) < 0) {
                 store_close(&candidate);
                 if (protocol_send_error(client_fd, "cannot restore context") < 0) break;
                 continue;
             }
+            // 候选会话及上下文都准备好后，释放旧资源，再接管新对象中的指针和锁描述符
             logger_close(&logger); store_close(&stored); session_destroy(&session);
             stored = candidate; session = restored;
+            // 聊天日志打不开只在服务端提示；随后发送 OPENED、完整历史和 HISTORY_END
             if (open_log(&logger, directory, stored.id) < 0) perror("server: open session log");
             if (send_history(client_fd, &stored) < 0) break;
             continue;
         }
+        // 剩余请求必须是 Q <问题>；line + 2 跳过前缀，恢复正文中的换行、回车和反斜杠
         if (strncmp(line, "Q ", 2) != 0 || protocol_unescape(line + 2, question, sizeof(question)) < 0) {
             if (protocol_send_error(client_fd, "invalid request") < 0) break;
             continue;
         }
+        // 尚未选择会话时：管理模式提示先选择；普通模式兼容旧客户端，自动创建会话
         if (!stored.id) {
             if (managed) { (void)protocol_send_error(client_fd, "select a session first"); continue; }
             if (store_create(directory, &stored) < 0) {
@@ -201,8 +220,8 @@ static void handle_client(int client_fd, const char *directory) {
             }
             if (open_log(&logger, directory, stored.id) < 0) perror("server: open session log");
         }
-        /* Build a disposable context: trimming a failed request must never
-         * remove the oldest successful turn from the selected session. */
+        // 每轮从持久历史构建临时上下文 working，再加入本次问题
+        // 添加消息可能裁剪旧轮次；请求失败时丢弃 working，避免影响已保存的成功历史
         session_t working;
         if (store_context(&stored, &working) < 0) {
             (void)protocol_send_error(client_fd, "cannot restore context"); continue;
@@ -211,32 +230,45 @@ static void handle_client(int client_fd, const char *directory) {
             session_destroy(&working);
             (void)protocol_send_error(client_fd, "cannot store input"); continue;
         }
+        // BEGIN 通知客户端开始回复；发送失败则释放临时上下文并结束当前连接处理
         if (protocol_send_begin(client_fd) < 0) { session_destroy(&working); break; }
+        // stream 保存客户端描述符和累计回复缓冲区，其余字段自动初始化为 0
         stream_context_t stream = {.client_fd = client_fd};
+        // 模型服务默认位于 127.0.0.1:8080，HTTP 路径为 /v1/chat/completions
         const ai_client_config_t config = {
             .host = AI_DEFAULT_HOST, .port = AI_DEFAULT_PORT, .path = AI_DEFAULT_PATH,
         };
         char error[256] = {0};
+        // 模型每返回一块文本就调用 forward_model_chunk：发送 DATA，并累计完整回答
+        // &stream 是传给回调的附带数据；模型调用失败时将原因写入 error
         result = ai_client_stream(&config, &working, forward_model_chunk, &stream, error, sizeof(error));
+        // 没有收到正文时使用空字符串，避免后续把空指针当作回答文本
         const char *answer = stream.response ? stream.response : "";
         if (result == 0 && session_add_assistant(&working, answer) < 0) {
             result = -1; snprintf(error, sizeof(error), "cannot store reply");
         }
+        // 只有生成及内存上下文更新成功，才将问题与回答作为完整一轮保存到会话文件
         if (result == 0 && store_commit_turn(&stored, question, answer) < 0) {
             result = -1; snprintf(error, sizeof(error), "cannot save conversation; turn not saved");
         }
         if (result == 0) {
+            // 成功后将 working 的资源交给 session；此分支不能再销毁 working
             session_destroy(&session); session = working;
+            // 可读聊天日志失败不撤销已保存会话；持久化成功后才发送 END 完成标记
             if (logger_write_user(&logger, question) < 0 || logger_write_assistant(&logger, answer) < 0)
                 perror("server: write session log");
             result = protocol_send_end(client_fd);
         } else {
+            // 生成或保存失败：丢弃临时上下文，发送 ERROR，本轮不进入持久历史
             session_destroy(&working);
             result = protocol_send_error(client_fd, error[0] ? error : "model request failed; turn not saved");
         }
+        // 无论成功失败都释放累计回答；此时 result 已变成 END/ERROR 的发送结果
         free(stream.response);
+        // 错误提示发送成功可以继续聊天；最终响应发送失败则退出当前客户端循环
         if (result < 0) break;
     }
+    // 统一清理当前会话日志、完整历史、会话锁和上下文；client_fd 由调用方关闭
     logger_close(&logger); store_close(&stored); session_destroy(&session);
 }
 
